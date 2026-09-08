@@ -34,7 +34,7 @@ A naive approach to estimating the 100-year TWL combines separately-derived retu
 
 ```
 Flooding/
-├── TWL_Analysis_copula.m       # Main analysis script (start here)
+├── TRIM_main.m                 # Main analysis script (start here)
 ├── tide_data.m                 # Downloads NOAA tide/water-level data
 ├── Get_ERA5_Waves.m            # Downloads ERA5 wave reanalysis (calls Python)
 ├── Get_ERA5_Waves.py           # Python CDS API helper (called by Get_ERA5_Waves.m)
@@ -42,7 +42,6 @@ Flooding/
 ├── Becker2026.m                # Wave runup parameterisation (dissipative fringing reef)
 ├── ddm2dd.m                    # Degrees-decimal-minutes to decimal-degrees coordinate parser
 ├── navd88_to_egm2008.m         # NAVD88 -> EGM2008 datum conversion via NOAA VDatum API
-├── Analyze_FloodOutput.m       # Post-processing / coastline elevation analysis
 ├── Data/
 │   └── CACC_CoastlineElevations.mat
 └── WaveFlood/                  # Python virtual environment (not tracked by git)
@@ -246,11 +245,6 @@ Converts NAVD88 orthometric heights to EGM2008 (WGS84) ellipsoidal heights via N
 
 ---
 
-### `Analyze_FloodOutput.m`
-
-Post-processing script for flood output analysis using CACC coastline elevation data (`Data/CACC_CoastlineElevations.mat`). Work in progress.
-
----
 
 ## Method
 
