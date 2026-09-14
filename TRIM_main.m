@@ -288,8 +288,12 @@ if CALC_WAVES == 1
     cluster_starts  = [1; find(gaps > min_sep_steps) + 1];  % positions within exceedance_idx
     n_storms        = length(cluster_starts);
 
-    storm_peak_Hs = zeros(n_storms, 1);
-    storm_peak_Tp = zeros(n_storms, 1);
+    storm_peak_Hs  = zeros(n_storms, 1);
+    storm_peak_Tp  = zeros(n_storms, 1);
+    storm_peak_idx = zeros(n_storms, 1);   % ERA5-array index of each storm peak (used
+                                            % below, once NOAA/ERA5 alignment is built in
+                                            % STEP A, to look up the co-occurring surge
+                                            % value for the surge GPD tail)
 
     for k = 1:n_storms
         if k < n_storms
@@ -299,6 +303,7 @@ if CALC_WAVES == 1
         end
         [storm_peak_Hs(k), pk] = max(Hs_ERA5(cluster_idx));
         storm_peak_Tp(k)       = Tp_ERA5(cluster_idx(pk));
+        storm_peak_idx(k)      = cluster_idx(pk);
     end
 
     % --- Step 3: GPD fit to storm-peak excesses ---
@@ -546,6 +551,20 @@ if CALC_WAVES == 1
     fprintf('Alignment: %d concurrent (tide, surge, Hs) observations (%.1f per year)\n', ...
             n_conc, n_conc / n_years_waves);
 
+    % Surge value co-occurring with each Hs-defined storm peak (feeds the
+    % surge GPD tail in STEP E2 below). Storms are defined by Hs alone
+    % (Step 1-4 above) — this just looks up the concurrent NOAA surge at
+    % each storm's ERA5 timestamp, reusing the same nearest-match alignment
+    % (noaa_idx_all) and quality checks (time_offset, noaa_is_bad) as the
+    % rest of STEP A.
+    storm_time_offset = time_offset(storm_peak_idx);
+    storm_is_bad      = noaa_is_bad(noaa_idx_all(storm_peak_idx));
+    storm_keep        = storm_time_offset < 3600 & ~storm_is_bad;
+    storm_peak_surge  = SS_full(noaa_idx_all(storm_peak_idx(storm_keep)));
+
+    fprintf('Surge matched to %d/%d Hs storm peaks (dropped %d for bad/misaligned NOAA data)\n', ...
+            sum(storm_keep), n_storms, n_storms - sum(storm_keep));
+
 
     %% ── STEP B: TRIVARIATE PSEUDO-OBSERVATIONS ───────────────────────────────
     % Rank-based transform to uniform marginals [0,1] for all three variables.
@@ -765,6 +784,34 @@ if CALC_WAVES == 1
             numel(predi_v), n_conc);
 
 
+    %% ── STEP E2: HYBRID SURGE MARGINAL ───────────────────────────────────────
+    % Same hybrid empirical/GPD idea as Step E for Hs, but storms here are
+    % defined by Hs alone (intentionally, not an independent surge POT
+    % declustering): the GPD tail is fit to the surge values that
+    % co-occurred with each Hs storm peak (storm_peak_surge, from STEP A
+    % above), using exceedances above a fixed percentile of the concurrent
+    % surge marginal. This lets the Monte Carlo sample surge beyond the
+    % observed concurrent record for high-U draws, fixing the same
+    % unprincipled linear-extrapolation issue Hs already avoids — without
+    % imposing a second, independent storm-arrival criterion on surge.
+
+    surge_thresh   = prctile(surge_conc, 95);
+    p_thresh_surge = mean(surge_conc <= surge_thresh);   % F(surge_thresh) in concurrent data
+
+    surge_exceed = storm_peak_surge(storm_peak_surge > surge_thresh);
+    if isempty(surge_exceed)
+        error(['No Hs-storm-peak surge values exceed the 95th-percentile surge ' ...
+               'threshold (u = %.3f m). Cannot fit a surge GPD tail.'], surge_thresh);
+    end
+    excesses_surge = surge_exceed - surge_thresh;
+    pd_GPD_surge   = fitdist(excesses_surge, 'GeneralizedPareto', 'theta', 0);
+
+    fprintf('Hybrid surge marginal: empirical below u = %.3f m (p = %.4f), GPD above.\n', ...
+            surge_thresh, p_thresh_surge);
+    fprintf('  Surge GPD fit (Hs-storm-peak surge exceedances, n=%d):  sigma = %.3f m,  xi = %.3f\n', ...
+            numel(excesses_surge), pd_GPD_surge.sigma, pd_GPD_surge.k);
+
+
     %% ── STEP F: TRIVARIATE MONTE CARLO → TWL ────────────────────────────────
     % For each repetition, draw N_y ~ Poisson(lambda_waves) storm events for
     % each of 100 simulated years, back-transform to (tide, surge, Hs),
@@ -832,12 +879,28 @@ if CALC_WAVES == 1
         tide_samp = interp1(q_knots_full_tide, tide_full_sorted, ...
                             U_samp(:,1), 'linear', 'extrap');
 
-        % ── Back-transform surge (column 2) — concurrent marginal ─────────
-        % Intentionally uses the 12-hourly concurrent surge, not the full
-        % hourly record: surge is stochastic and its distribution at ERA5
-        % timestamps is the correct conditioning population for this copula.
-        surge_samp = interp1(q_knots_conc_surge, surge_conc_sorted, ...
-                             U_samp(:,2), 'linear', 'extrap');
+        % ── Back-transform surge (column 2) — hybrid empirical / GPD ─────
+        % Body: the 12-hourly concurrent surge, not the full hourly record
+        % — surge is stochastic and its distribution at ERA5 timestamps is
+        % the correct conditioning population for this copula.
+        % Tail: a GPD fit to surge co-occurring with Hs storm peaks (STEP
+        % E2), so extreme co-occurring surge can extend beyond the observed
+        % concurrent record, mirroring the Hs treatment.
+        % NOTE: unlike Hs, U_samp(:,2) is NOT rescaled here. Storms are
+        % defined by Hs alone, so surge should retain whatever the copula
+        % draws for each event rather than being forced into its own
+        % extreme branch every time — that would double up the storm
+        % criterion and distort the fitted tide–surge–Hs dependence.
+        u_surge_col = U_samp(:, 2);
+        surge_samp  = zeros(N_total, 1);
+
+        surge_below = u_surge_col <= p_thresh_surge;
+        surge_samp(surge_below) = interp1(q_knots_conc_surge, surge_conc_sorted, ...
+                                          u_surge_col(surge_below), 'linear', 'extrap');
+
+        p_cond_surge = (u_surge_col(~surge_below) - p_thresh_surge) / (1 - p_thresh_surge);
+        p_cond_surge = min(max(p_cond_surge, 0), 1 - 1e-10);
+        surge_samp(~surge_below) = surge_thresh + icdf(pd_GPD_surge, p_cond_surge);
 
         % ── Back-transform Hs (column 3) — hybrid empirical / GPD ─────────
         u_Hs_col  = U_samp(:,3);
