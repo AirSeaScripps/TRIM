@@ -7,7 +7,7 @@ clear all
 % Total Water Level (TWL) is estimated using a copula-based joint
 % probability model:
 %
-%   CALC_WAVES = 1  (preferred):
+%   CALC_WAVES = 1  (If waves are significant to flooding):
 %     A trivariate t-copula is fitted to concurrent (tide, surge, Hs)
 %     observations.  Tp is estimated from a power-law regression on storm
 %     peaks.  TWL is computed directly inside the Monte Carlo as:
@@ -17,7 +17,7 @@ clear all
 %     wave co-occurrence and avoids combining separately-derived return
 %     levels (which assumes independence and overcounts joint probability).
 %
-%   CALC_WAVES = 0  (fallback):
+%   CALC_WAVES = 0  (For areas sheltered from waves):
 %     A bivariate t-copula is fitted to (tide, surge) pairs.  Wave runup
 %     is set to zero.  Useful for sites with no offshore wave data or
 %     where the coast is sheltered from significant swell.
@@ -135,16 +135,7 @@ repeats = 300;
 % Storm surge is temporally autocorrelated — a single storm can sustain
 % elevated water levels for many consecutive hours, so successive hourly
 % observations are NOT independent.
-%
-% Previously, tau_hours was also used to define n_eff_per_year for the
-% Monte Carlo (n_eff = floor(8760/tau_hours)).  That approach is sensitive
-% to tau_hours: varying it from 12 to 72 h shifts the 100-yr TWL by ~0.6 m,
-% making the result dependent on an arbitrary tuning parameter.
-%
-% The current approach instead derives n_eff_per_year directly from the
-% number of POT-identified storm peaks (lambda_waves × 100 yr), exactly as
-% the wave extreme-value analysis does.  tau_hours is retained only to set
-% the minimum inter-storm separation during ERA5 declustering.
+
 tau_hours = 24;
 
 %% Extract data directly from API call to NOAA and ERA5
@@ -204,9 +195,6 @@ end
 % stations with long enough records (e.g. Alaska sites going back to the
 % 1970s) can hit this, which breaks interp1 later since it requires
 % unique sample points. Keep the first occurrence of each duplicate.
-% Applied unconditionally (both the infile/cached-load path and the fresh
-% NOAA-download path) so old cached .mat files that predate this fix are
-% cleaned up on load too.
 [d_t, keep_idx] = unique(d_t, 'stable');
 if numel(keep_idx) < numel(predi)
     fprintf('Removed %d duplicate timestamp(s) from d_t (kept first occurrence).\n', ...
@@ -489,14 +477,14 @@ SLR_predict = P(1)*ntsteps + yfit(end); % slope * years + current SLR (with refe
 
 %% Copula-based 100-year return level
 %
-% When CALC_WAVES = 1 (preferred):
+% When CALC_WAVES = 1:
 %   A trivariate (tide, surge, Hs) t-copula captures the joint dependence
 %   of all three components.  TWL is computed directly as
 %     TWL = tide + surge + Stockdon(Hs, Tp, beta)
 %   inside each Monte Carlo draw.  Annual maxima are fitted with a GEV to
 %   give the 100-year TWL.  value_99 therefore already includes wave runup.
 %
-% When CALC_WAVES = 0 (fallback):
+% When CALC_WAVES = 0 :
 %   A bivariate (tide, surge) copula is used.  Wave runup = 0 (R2 = 0).
 %   value_99 is the 100-year tide + surge return level.
 %
@@ -1112,7 +1100,7 @@ if CALC_WAVES == 1
 
 elseif CALC_WAVES == 0
 
-    %% ── BIVARIATE COPULA (tide, surge) — CALC_WAVES = 0 FALLBACK ────────────
+    %% ── BIVARIATE COPULA (tide, surge) — CALC_WAVES = 0  ────────────
     %
     % Steps:
     %   1. Map tide and surge to uniform marginals via rank-based
@@ -1201,7 +1189,17 @@ elseif CALC_WAVES == 0
     grid on;
     sgtitle(sprintf('%s copula — tide vs surge', COPULA_FAMILY), 'fontsize', 13);
 
-    % --- Step 4: Monte Carlo sampling from the bivariate copula ---
+    % --- Step 4: Storm surge extreme-value tail (POT + GPD) ---
+    % Mirrors the Hs treatment in the trivariate branch (Step 1-3, Step E
+    % above): a purely empirical surge marginal has no principled basis for
+    % extrapolating past the single worst historical storm, which is exactly
+    % the failure mode that makes this branch undershoot NOAA's own GEV-based
+    % 100-yr estimate at surge-dominated sites (e.g. hurricane/nor'easter
+    % climatology in funnel-shaped estuaries like the Chesapeake). Fitting a
+    % GPD to POT-declustered storm-peak surge excesses — the same
+    % Pickands-Balkema-de Haan-justified approach used for Hs — lets the
+    % Monte Carlo sample surge levels beyond the observed record maximum.
+    %
     % Derive n_eff_per_year from a POT declustering of the surge record,
     % exactly mirroring the wave analysis.  This removes tau_hours as a
     % tuning parameter for the return-level result: the number of independent
@@ -1209,19 +1207,69 @@ elseif CALC_WAVES == 0
     surge_thresh     = prctile(SS, 95);           % 95th-percentile surge threshold
     min_sep_surge    = ceil(tau_hours);            % minimum gap between surge events (hours; dt=1h)
     surge_exceed_idx = find(SS > surge_thresh);
-    if ~isempty(surge_exceed_idx)
-        gaps_surge         = diff(surge_exceed_idx);
-        cluster_starts_sg  = [1; find(gaps_surge > min_sep_surge) + 1];
-        n_surge_storms     = length(cluster_starts_sg);
-    else
-        n_surge_storms = 0;
+    if isempty(surge_exceed_idx)
+        error('No surge exceedances above the 95th percentile threshold (u = %.3f m). Check the surge record.', surge_thresh);
     end
+    gaps_surge         = diff(surge_exceed_idx);
+    cluster_starts_sg  = [1; find(gaps_surge > min_sep_surge) + 1];
+    n_surge_storms     = length(cluster_starts_sg);
+
+    storm_peak_surge = zeros(n_surge_storms, 1);
+    for k = 1:n_surge_storms
+        if k < n_surge_storms
+            cluster_idx = surge_exceed_idx(cluster_starts_sg(k) : cluster_starts_sg(k+1) - 1);
+        else
+            cluster_idx = surge_exceed_idx(cluster_starts_sg(k) : end);
+        end
+        storm_peak_surge(k) = max(SS(cluster_idx));
+    end
+
     n_years_surge  = numel(SS) / 8760;            % record length in years
     lambda_surge   = n_surge_storms / n_years_surge;
 
     fprintf('Surge POT declustering (u = %.3f m, 95th pct):  %d storms / %.1f yr  →  lambda = %.2f storms/yr\n', ...
             surge_thresh, n_surge_storms, n_years_surge, lambda_surge);
     fprintf('  N_y ~ Poisson(%.2f) drawn each simulated year (tau_hours used for separation only)\n', lambda_surge);
+
+    % GPD fit to storm-peak surge excesses above threshold
+    excesses_surge = storm_peak_surge - surge_thresh;
+    pd_GPD_surge   = fitdist(excesses_surge, 'GeneralizedPareto', 'theta', 0);
+    fprintf('  Surge GPD fit:  sigma = %.3f m,  xi = %.3f\n', pd_GPD_surge.sigma, pd_GPD_surge.k);
+
+    % Poisson-GPD 100-yr surge level, diagnostic only (not used directly in
+    % the copula Monte Carlo below, but a useful sanity check against
+    % NOAA-style direct-GEV methods).
+    if lambda_surge * 100 >= 1
+        p_GPD_surge = 1 - 1 / (lambda_surge * 100);
+        surge100    = surge_thresh + icdf(pd_GPD_surge, p_GPD_surge);
+        fprintf('  Surge100 (POT+GPD, diagnostic) = %.3f m\n', surge100);
+    end
+
+    % Hybrid empirical/GPD surge marginal: empirical quantile below the POT
+    % threshold, GPD tail above it. p_thresh_surge is the empirical CDF
+    % value of surge_thresh in the full hourly record (the same population
+    % whose ranks define u_surge above), ensuring consistency between the
+    % copula marginal and the back-transform split point.
+    p_thresh_surge = mean(SS <= surge_thresh);
+    fprintf('Hybrid surge marginal: empirical below u = %.3f m (p = %.4f), GPD above.\n', ...
+            surge_thresh, p_thresh_surge);
+
+    % --- Diagnostic plot: GPD fit to storm-peak surge excesses ---
+    x_exc_sg = linspace(0, max(excesses_surge), 200);
+    y_gpd_sg = pdf(pd_GPD_surge, x_exc_sg);
+    figure;
+    hold on
+    histogram(excesses_surge, 30, 'Normalization', 'pdf', 'FaceColor', [0.4 0.4 0.4], 'EdgeColor', 'none')
+    plot(x_exc_sg, y_gpd_sg, 'r-', 'LineWidth', 2.5)
+    xlabel('Surge $- u \quad [\mathrm{m}]$ (excess above threshold)', 'interpreter', 'latex', 'fontsize', 14)
+    ylabel('Probability Density', 'fontsize', 14)
+    title(sprintf('POT storm-surge peaks — GPD fit  (u = %.3f m, %d storms, %.1f yr)', ...
+          surge_thresh, n_surge_storms, n_years_surge), 'fontsize', 12)
+    legend('Declustered storm-surge peaks', sprintf('GPD  (\\sigma=%.3f, \\xi=%.3f)', pd_GPD_surge.sigma, pd_GPD_surge.k), ...
+           'Location', 'northeast', 'fontsize', 12)
+    box on; grid on;
+    hold off
+
     fprintf('Running bivariate copula Monte Carlo (%d repetitions × 100 yr)...\n', repeats);
 
     annual_maxima = NaN(100, repeats);   % NaN-initialised; zero-storm years stay NaN
@@ -1241,9 +1289,40 @@ elseif CALC_WAVES == 0
             U_samp = copularnd('Gumbel', theta_cop, N_total);
         end
 
-        tide_samp  = interp1(q_knots, predi_sorted, U_samp(:, 1), 'linear', 'extrap');
-        surge_samp = interp1(q_knots, SS_sorted,    U_samp(:, 2), 'linear', 'extrap');
-        twl_samp   = tide_samp + surge_samp;   % R2 = 0 when CALC_WAVES = 0
+        % ── Restrict each event to be a true storm (surge > u) ───────────
+        % N_y ~ Poisson(lambda_surge) is drawn from the POT-declustered storm
+        % rate, which by definition counts only independent surge peaks above
+        % u. A copula draw with u_surge uniform on [0,1] however sends most
+        % events through the empirical (sub-threshold) branch of the
+        % marginal, dropping the effective storm rate and undersampling the
+        % extreme tail. Rescaling onto (p_thresh_surge, 1] enforces that
+        % every simulated event has surge > u, restoring consistency with
+        % the POT-derived lambda_surge. Mirrors the identical Hs rescaling
+        % in the trivariate branch (Step F) — see that comment for the full
+        % rationale, including the accept-reject-equivalence discussion.
+        U_samp(:, 2) = p_thresh_surge + (1 - p_thresh_surge) * U_samp(:, 2);
+
+        tide_samp = interp1(q_knots, predi_sorted, U_samp(:, 1), 'linear', 'extrap');
+
+        % ── Back-transform surge (column 2) — hybrid empirical / GPD ─────
+        u_surge_col = U_samp(:, 2);
+        surge_samp  = zeros(N_total, 1);
+
+        % Body (below POT threshold): empirical quantile. Unreachable after
+        % the rescaling above (u_surge_col is always > p_thresh_surge), kept
+        % for symmetry with the trivariate Hs back-transform and as a guard
+        % if the rescaling above is ever removed.
+        below = u_surge_col <= p_thresh_surge;
+        surge_samp(below) = interp1(q_knots, SS_sorted, ...
+                                     u_surge_col(below), 'linear', 'extrap');
+
+        % Tail (above POT threshold): rescale to conditional probability, invert GPD
+        %   P(surge > x | surge > u) = (u_surge - p_thresh) / (1 - p_thresh)
+        p_cond = (u_surge_col(~below) - p_thresh_surge) / (1 - p_thresh_surge);
+        p_cond = min(max(p_cond, 0), 1 - 1e-10);   % clamp to valid range for icdf
+        surge_samp(~below) = surge_thresh + icdf(pd_GPD_surge, p_cond);
+
+        twl_samp = tide_samp + surge_samp;   % R2 = 0 when CALC_WAVES = 0
 
         cum_n = [0; cumsum(N_per_year)];
         for y = 1:100
@@ -1387,7 +1466,7 @@ if CALC_WAVES == 1
     fprintf('  \\newcommand{\\TSS}{%.2f m}\n', TSS_100);
     fprintf('  \\newcommand{\\StormRate}{%.2f~storms/yr}\n', lambda_waves);
 else
-    % No wave runup in the bivariate fallback (R2 = 0 by construction), so
+    % No wave runup in the bivariate case (R2 = 0 by construction), so
     % the tide+surge contribution IS the reported 100-yr return level.
     R2_100  = 0;
     TSS_100 = value_99;
@@ -1408,6 +1487,11 @@ else
     fprintf('Sea level rise over record: %.2f mm/yr\n', P(1)*24*365*1000);
     fprintf('Storm rate (data-derived): lambda = %.2f storms/yr  (N_y ~ Poisson each simulated year)\n', lambda_surge);
     fprintf('  (tau_hours = %d h used for surge POT declustering only; not a tuning parameter for TWL)\n', tau_hours);
+    fprintf('Surge POT+GPD tail:  u = %.3f m, sigma = %.3f m, xi = %.3f  (%d storms)\n', ...
+            surge_thresh, pd_GPD_surge.sigma, pd_GPD_surge.k, n_surge_storms);
+    if exist('surge100', 'var')
+        fprintf('  Surge100 (POT+GPD, diagnostic, independent of copula): %.3f m\n', surge100);
+    end
     fprintf('----------------------------------------------\n');
     fprintf('LaTeX summary macros (paste into report):\n');
     fprintf('  \\newcommand{\\TWE}{%.2f m}\n', value_99 + SLR + MHHW_el + NAVD88_to_EGM);
